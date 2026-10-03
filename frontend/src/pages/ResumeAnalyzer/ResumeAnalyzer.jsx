@@ -19,6 +19,12 @@ const FORMAT_LABEL = {
 
 const FILE_ACCEPT = '.pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain'
 
+function usageLabel(usage) {
+  const total = Number(usage?.totalTokens || 0)
+  if (!Number.isFinite(total) || total <= 0) return ''
+  return `${total.toLocaleString('en-US')} tokens used`
+}
+
 function scoreLabel(score) {
   if (score >= 80) return 'Strong'
   if (score >= 60) return 'Needs work'
@@ -169,7 +175,10 @@ export default function ResumeAnalyzer() {
               {issues.map((item) => (
                 <li key={item.title}>
                   <span className={`analyzer-status is-${item.status}`}>{item.status}</span>
-                  <div><strong>{item.title}</strong><p>{item.detail}</p></div>
+                  <div>
+                    <strong>{item.title}</strong>
+                    <p>{item.detail}</p>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -205,6 +214,7 @@ export default function ResumeAnalyzer() {
               {status === 'downloading' ? 'Preparing…' : `Download ${fileLabel}`}
             </Button>
             <p>{report?.rewriteReady ? `Updated ${fileLabel} is ready.` : 'Apply the changes, then download the updated file.'}</p>
+            {usageLabel(report?.usage) ? <p className="analyzer-usage">{usageLabel(report.usage)}</p> : null}
           </div>
         ) : null}
       </section>

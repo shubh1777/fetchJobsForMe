@@ -86,14 +86,20 @@
 .analyzer-checklist li { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 12px; align-items: start; }
 .analyzer-status {
   display: inline-flex;
+  align-items: center;
+  align-self: start;
   justify-content: center;
-  margin-top: 2px;
-  padding: 3px 8px;
+  width: max-content;
+  min-height: 20px;
+  margin-top: 1px;
+  padding: 2px 8px;
   border-radius: 999px;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: .04em;
+  line-height: 1.2;
   text-transform: capitalize;
+  white-space: nowrap;
 }
 .analyzer-status.is-good { color: #8ef0c8; background: #14352c; }
 .analyzer-status.is-weak,
@@ -137,10 +143,23 @@
 .analyzer-bars > div > div { height: 6px; overflow: hidden; border-radius: 99px; background: #242b38; }
 .analyzer-bars i { display: block; height: 100%; background: #6d5dfc; }
 .analyzer-issues { margin: 0; padding: 0; list-style: none; }
-.analyzer-issues li { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 12px; padding: 12px 0; border-bottom: 1px solid #242b38; }
-.analyzer-issues p { margin: 4px 0 0; color: #8d98aa; font-size: 12px; line-height: 1.5; }
+.analyzer-issues li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 12px;
+  align-items: start;
+  padding: 12px 0;
+  border-bottom: 1px solid #242b38;
+}
+.analyzer-issues strong { display: block; font-size: 13px; line-height: 1.4; }
+.analyzer-issues p { margin: 3px 0 0; color: #8d98aa; font-size: 12px; line-height: 1.5; }
 .analyzer-apply { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 18px; }
 .analyzer-apply p { flex-basis: 100%; margin: 0; color: #8d98aa; font-size: 12px; }
+.analyzer-apply .analyzer-usage {
+  color: rgba(157, 168, 184, 0.6);
+  font-size: 11px;
+  line-height: 1.4;
+}
 
 .app-root[data-theme='light'] .analyzer-page { color: #202b40; }
 .app-root[data-theme='light'] .analyzer-heading,
@@ -198,6 +217,7 @@
 .app-root[data-theme='light'] .analyzer-bars strong,
 .app-root[data-theme='light'] .analyzer-issues p,
 .app-root[data-theme='light'] .analyzer-apply p { color: #5d6b82; }
+.app-root[data-theme='light'] .analyzer-apply .analyzer-usage { color: rgba(93, 107, 130, 0.6); }
 .app-root[data-theme='light'] .analyzer-bars > div > div { background: #e6e9f0; }
 .app-root[data-theme='light'] .analyzer-issues li { border-color: #dce2eb; }
 

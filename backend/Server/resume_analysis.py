@@ -366,7 +366,41 @@ def _listed_flash_models(client) -> list[str]:
     return _ordered(names)
 
 
-def _generate(client, prompt: str) -> dict:
+def _token_count(meta, name: str) -> int:
+    if meta is None:
+        return 0
+    value = meta.get(name) if isinstance(meta, dict) else getattr(meta, name, None)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage(response) -> dict:
+    """Token counts Gemini reports for one call. Missing metadata stays at zero."""
+    meta = getattr(response, "usage_metadata", None)
+    prompt = _token_count(meta, "prompt_token_count")
+    output = _token_count(meta, "candidates_token_count")
+    total = _token_count(meta, "total_token_count") or (prompt + output)
+    return {"promptTokens": prompt, "outputTokens": output, "totalTokens": total}
+
+
+def _add_usage(current, extra: dict) -> dict:
+    base = current if isinstance(current, dict) else {}
+
+    def count(source, key: str) -> int:
+        try:
+            return max(0, int(source.get(key) or 0))
+        except (TypeError, ValueError, AttributeError):
+            return 0
+
+    prompt = count(base, "promptTokens") + count(extra, "promptTokens")
+    output = count(base, "outputTokens") + count(extra, "outputTokens")
+    total = count(base, "totalTokens") + count(extra, "totalTokens")
+    return {"promptTokens": prompt, "outputTokens": output, "totalTokens": total}
+
+
+def _generate(client, prompt: str) -> tuple[dict, dict]:
     global _working_model
     from Server.server import event
 
@@ -383,7 +417,7 @@ def _generate(client, prompt: str) -> dict:
             event("resume", "warning", f"gemini model skipped {model}")
             continue
         _working_model = model
-        return _parse_json(getattr(response, "text", "") or "")
+        return _parse_json(getattr(response, "text", "") or ""), _usage(response)
     for model in _listed_flash_models(client):
         if model in tried:
             continue
@@ -396,7 +430,7 @@ def _generate(client, prompt: str) -> dict:
             event("resume", "warning", f"gemini model skipped {model}")
             continue
         _working_model = model
-        return _parse_json(getattr(response, "text", "") or "")
+        return _parse_json(getattr(response, "text", "") or ""), _usage(response)
     raise ValueError("Every free Gemini model is busy right now. Try again in a minute.") from last_error
 
 
@@ -430,6 +464,7 @@ def _view(stored: dict, meta: dict, cached: bool) -> dict:
         "comparison": comparison,
         "improvement": stored.get("improvement") if isinstance(stored.get("improvement"), dict) else None,
         "rewriteReady": bool(rewrite and rewrite.get("text")),
+        "usage": _add_usage(stored.get("usage"), {}),
     }
 
 
@@ -510,7 +545,8 @@ def analyze_resume(uid: str, client, force: bool = False) -> dict:
         "improvements and checklist items use title and detail. strengths and skills are strings.\n\n"
         f"Resume:\n{meta['sourceText']}"
     )
-    analysis = _analysis(_generate(client, prompt))
+    raw, call_usage = _generate(client, prompt)
+    analysis = _analysis(raw)
     payload = {
         "sourceText": meta["sourceText"],
         "sourceHash": meta["sourceHash"],
@@ -525,6 +561,7 @@ def analyze_resume(uid: str, client, force: bool = False) -> dict:
         "comparison": stored.get("comparison") if stored.get("sourceHash") == meta["sourceHash"] else None,
         "rewrite": stored.get("rewrite") if stored.get("rewriteHash") == meta["sourceHash"] else None,
         "rewriteHash": stored.get("rewriteHash") if stored.get("rewriteHash") == meta["sourceHash"] else "",
+        "usage": _add_usage(stored.get("usage"), call_usage),
     }
     _write(uid, payload)
     return _view(payload, meta, False)
@@ -586,7 +623,8 @@ def compare_resumes(uid: str, client, filename: str, content: bytes) -> dict:
         f"Resume A ({meta['filename']}):\n{meta['sourceText']}\n\n"
         f"Resume B ({other_name}):\n{other}"
     )
-    comparison = _comparison(_generate(client, prompt), other_name, other_hash)
+    raw, call_usage = _generate(client, prompt)
+    comparison = _comparison(raw, other_name, other_hash)
     comparison["sourceHash"] = meta["sourceHash"]
     payload = dict(stored)
     payload.update({
@@ -597,6 +635,7 @@ def compare_resumes(uid: str, client, filename: str, content: bytes) -> dict:
         "fullText": meta["fullText"],
         "model": MODEL,
         "comparison": comparison,
+        "usage": _add_usage(stored.get("usage"), call_usage),
     })
     _write(uid, payload)
     return _view(payload, meta, False)
@@ -631,7 +670,8 @@ def rewrite_resume(uid: str, client) -> dict:
         f"Notes:\n{notes or 'Tighten weak wording only. Keep every section.'}\n\n"
         f"Resume:\n{meta['sourceText']}"
     )
-    edited = str((_generate(client, prompt) or {}).get("text") or "").strip()
+    raw, call_usage = _generate(client, prompt)
+    edited = str((raw or {}).get("text") or "").strip()
     if len(edited) < max(40, int(len(meta["sourceText"]) * 0.7)):
         raise ValueError("The update dropped parts of the original resume. Try again.")
     rewrite = {"text": edited[:_MAX_TEXT]}
@@ -645,6 +685,7 @@ def rewrite_resume(uid: str, client) -> dict:
         "model": MODEL,
         "rewrite": rewrite,
         "rewriteHash": meta["sourceHash"],
+        "usage": _add_usage(stored.get("usage"), call_usage),
     })
     _write(uid, payload)
     return _view(payload, meta, False)
