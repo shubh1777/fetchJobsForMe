@@ -252,6 +252,7 @@
   scrollbar-width: none;
 }
 
+.portal-toggle-list.is-single { grid-template-columns: 1fr; max-height: none; }
 .portal-toggle-list::-webkit-scrollbar { display: none; }
 
 .portal-toggle-list li {

@@ -266,6 +266,40 @@ function SearchPreferences({ preferences, status, error, save }) {
   )
 }
 
+function AutoAnalysePreference({ preferences, status, error, save }) {
+  const enabled = preferences?.auto_analyse_resume !== false
+
+  const toggle = () => save({
+    ...preferences,
+    auto_analyse_resume: !enabled,
+  })
+
+  if (status === 'loading') return <p className="settings-muted">Loading preferences…</p>
+
+  return (
+    <div className="portal-preferences">
+      <p>On reviews a resume as soon as it is uploaded on Skills &amp; Profile. Off waits until you click Analyze.</p>
+      {error ? <p className="settings-error">{error.message}</p> : null}
+      <ul className="portal-toggle-list is-single">
+        <li>
+          <span>Auto analyse new resume</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={enabled}
+            aria-label={`Auto analyse new resume ${enabled ? 'on' : 'off'}`}
+            className={`portal-switch${enabled ? ' is-on' : ''}`}
+            disabled={status === 'saving'}
+            onClick={toggle}
+          >
+            <span />
+          </button>
+        </li>
+      </ul>
+    </div>
+  )
+}
+
 function PortalPreferences({ preferences, status, error, save }) {
   const [portals, setPortals] = useState(PORTALS.map(([key, label]) => ({ key, label })))
   const paused = new Set(
@@ -345,6 +379,11 @@ export default function Settings() {
           title: 'Preferred job portals',
           description: 'Choose which portals are included the next time jobs are fetched.',
           content: <PortalPreferences {...preferencesApi} />,
+        },
+        {
+          title: 'Resume analysis',
+          description: 'Review a new resume automatically, or only when you ask.',
+          content: <AutoAnalysePreference {...preferencesApi} />,
         },
       ]}
     />

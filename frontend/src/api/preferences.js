@@ -24,6 +24,7 @@ export async function fetchPreferences(signal) {
     ...data,
     apiKey: resolvedApiKey,
     geminiApiKey: resolvedApiKey,
+    auto_analyse_resume: data.auto_analyse_resume !== false,
     updatedAt: data.updatedAt?.toDate?.()?.toISOString() || data.updatedAt || '',
   }
 }
@@ -38,6 +39,7 @@ export async function savePreferences(preferences, signal) {
     experience: preferences?.experience ?? null,
     posted: preferences?.posted || 'all',
     geminiApiKey: resolvedApiKey,
+    auto_analyse_resume: preferences?.auto_analyse_resume !== false,
     updatedAt: serverTimestamp(),
   }
   if (Array.isArray(preferences?.pausedPortals)) {

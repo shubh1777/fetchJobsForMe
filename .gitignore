@@ -7,3 +7,6 @@ backend/data/
 !.env.example
 
 backend/secrets/firebase-service-account.json
+
+.cursor/rules/
+backend/tests/

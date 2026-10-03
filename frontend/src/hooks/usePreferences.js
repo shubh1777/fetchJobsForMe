@@ -8,6 +8,7 @@ export const DEFAULT_PREFERENCES = {
   posted: 'all',
   roles: [],
   pausedPortals: DEFAULT_PAUSED_PORTALS,
+  auto_analyse_resume: true,
   geminiApiKey: '',
   updatedAt: '',
 }

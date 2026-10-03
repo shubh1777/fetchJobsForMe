@@ -842,6 +842,7 @@ def _empty_preferences() -> dict:
         "posted": "all",
         "roles": [],
         "pausedPortals": list(DEFAULT_PAUSED_PORTALS),
+        "auto_analyse_resume": True,
         "updatedAt": "",
     }
 
@@ -900,6 +901,8 @@ def _preferences_from_payload(payload: dict) -> dict:
     updated = payload.get("updatedAt")
     result["updatedAt"] = "" if updated is None else str(updated)
     result["pausedPortals"] = _paused_portals(payload)
+    if "auto_analyse_resume" in payload:
+        result["auto_analyse_resume"] = bool(payload.get("auto_analyse_resume"))
     return result
 
 
@@ -936,6 +939,7 @@ def update_preferences(uid: str, changes: dict) -> dict:
             clean(str(role))[:80] for role in roles if clean(str(role))
         ))[:20],
         "pausedPortals": _paused_portals(changes),
+        "auto_analyse_resume": bool(changes.get("auto_analyse_resume", True)),
         "updatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
     with _preferences_lock:
@@ -1291,9 +1295,9 @@ def _pdf_resume_text(content: bytes) -> str:
 
     # Second parser: PyMuPDF
     try:
-        import fitz
+        import pymupdf
 
-        document = fitz.open(
+        document = pymupdf.open(
             stream=content,
             filetype="pdf",
         )
@@ -1440,32 +1444,102 @@ def _clean_resume_lines(text: str) -> list[str]:
 
     return cleaned
 
+_BULLET = re.compile(
+    r"^\s*(?:[•●▪◦‣·∙○■□►▶✓✔➢➤❖\uf0b7\uf0a7\uf076\uf0d8\uf0fc*]|[-–—](?=\s))\s*"
+)
+_BULLET_CHARS = "•●▪◦‣·∙○■□►▶✓✔➢➤❖\uf0b7\uf0a7\uf076\uf0d8\uf0fc"
+
+# Checked in this order, so "Project Experience" is a project section
+# and "Coursework / Skills" is a skills section.
+_HEADING_KEYWORDS = (
+    ("projects", ("project",)),
+    ("skills", ("skill", "technolog", "competenc", "tech stack", "tools", "expertise", "proficienc")),
+    ("education", ("education", "academic", "qualification", "schooling")),
+    ("certifications", ("certific", "award", "achievement", "honor", "honour", "accomplishment")),
+    ("summary", ("summary", "profile", "objective", "about me", "overview")),
+    ("experience", ("experience", "employment", "work history", "career history", "internship")),
+    ("other", (
+        "training", "course", "workshop", "seminar", "activit", "interest", "hobb",
+        "language", "publication", "volunteer", "reference", "leadership",
+        "responsibilit", "declaration", "personal", "strength", "extra", "curricular",
+        "contact", "links",
+    )),
+)
+
+_ROLE_WORDS = re.compile(
+    r"\b(?:developer|engineer|intern|internship|analyst|manager|consultant|designer|tester|"
+    r"lead|architect|administrator|admin|specialist|associate|scientist|trainee|executive|"
+    r"officer|programmer|director|coordinator|assistant|devops|sre|qa|sde|technician|"
+    r"representative|researcher|instructor|teacher|freelancer|founder|co-founder|president|"
+    r"head|support|owner|member|fellow|apprentice|contractor)s?\b",
+    re.I,
+)
+
+_COMPANY_WORDS = re.compile(
+    r"\b(?:pvt|private|ltd|limited|inc|llc|llp|corp|corporation|company|co\.|technologies|"
+    r"technology|solutions|labs|systems|services|consulting|consultancy|software|softech|"
+    r"infotech|group|bank|university|college|institute|studio|ventures|global)\b",
+    re.I,
+)
+
+
+def _resume_rows(text: str) -> list[str]:
+    """Lines with their column gaps kept. Blank lines are dropped."""
+    text = str(text or "").replace("\x00", " ").replace("\r\n", "\n").replace("\r", "\n")
+    return [line.replace("\t", "    ").rstrip() for line in text.splitlines() if line.strip()]
+
+
+def _columns(row: str) -> list[str]:
+    parts = re.split(r"\s{3,}|\s+\|\s+", row.strip())
+    return [part.strip(" |") for part in parts if part.strip(" |")]
+
+
+def _section_heading(row: str) -> Optional[str]:
+    """Section type for a heading row, or None when the row is content."""
+    known = _heading_type(row)
+    if known:
+        return known
+    line = row.strip()
+    if _BULLET.match(line) or len(_columns(line)) > 1:
+        return None
+    line = re.sub(r"^[\s#*_\-–—|]+|[\s#*_\-–—|:]+$", "", line)
+    if not line or len(line) > 45 or len(line.split()) > 6:
+        return None
+    if re.search(r"\d|@|:|\.$|,", line) or _ROLE_WORDS.search(re.sub(r"internships?", "", line, flags=re.I)):
+        return None
+    folded = line.casefold()
+    for section, keywords in _HEADING_KEYWORDS:
+        if any(re.search(rf"\b{re.escape(word)}", folded) for word in keywords):
+            return section
+    return None
+
+
+def _resume_sections(text: str) -> dict[str, list[str]]:
+    """Rows grouped by section. Repeated sections of one type are joined."""
+    sections: dict[str, list[str]] = {}
+    current = "header"
+    for row in _resume_rows(text):
+        kind = _section_heading(row)
+        if kind:
+            current = kind
+            sections.setdefault(current, [])
+            continue
+        sections.setdefault(current, []).append(row)
+    return sections
+
+
+def _section_text(rows: list[str]) -> str:
+    lines = []
+    for row in rows:
+        parts = [re.sub(r"\s*[-–—|,]+$", "", part).strip() for part in _columns(row)]
+        line = " · ".join(part for part in parts if part)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)[:10_000]
+
+
 def _extract_section(lines: list[str], section_name: str) -> str:
-    """
-    Extract one section and stop at the next recognized heading.
-
-    This prevents Certifications, Achievements and Education from being
-    included in experience history.
-    """
-    start_index = None
-
-    for index, line in enumerate(lines):
-        if _heading_type(line) == section_name:
-            start_index = index + 1
-            break
-
-    if start_index is None:
-        return ""
-
-    selected = []
-
-    for line in lines[start_index:]:
-        if _heading_type(line) is not None:
-            break
-
-        selected.append(line)
-
-    return "\n".join(selected).strip()[:10_000]
+    return _section_text(_resume_sections("\n".join(lines)).get(section_name, []))
 
 
 def _looks_like_contact_line(line: str) -> bool:
@@ -1556,11 +1630,16 @@ def _extract_current_employment(
 
 _MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
 _YEAR = r"(?:19|20)\d{2}"
-_DATE_POINT = rf"(?:{_MONTH}\s+{_YEAR}|{_YEAR}|(?:0?[1-9]|1[0-2])/{_YEAR})"
+_DATE_POINT = (
+    rf"(?:(?:\d{{1,2}}(?:st|nd|rd|th)?[\s\-/]*)?{_MONTH}[\s\-/,']*{_YEAR}"
+    rf"|(?:0?[1-9]|1[0-2])\s*[/\-.\s]\s*{_YEAR}"
+    rf"|{_YEAR})"
+)
 _DATE_RANGE = re.compile(
-    rf"(?P<start>{_DATE_POINT})\s*(?:-|–|—|to)\s*(?P<end>{_DATE_POINT}|present|current|now)",
+    rf"(?P<start>{_DATE_POINT})\s*(?:-|–|—|to|till|until)\s*(?P<end>{_DATE_POINT}|present|current|now|ongoing|today)",
     re.I,
 )
+_DATE_SINGLE = re.compile(rf"^(?:{_DATE_POINT}|present)$", re.I)
 
 
 def _clean_job(item: dict) -> dict:
@@ -1600,91 +1679,234 @@ def _normalize_jobs(value, title: str = "", company: str = "") -> list[dict]:
 
 
 def _is_bullet(line: str) -> bool:
-    return bool(re.match(r"^(?:[•*]|\-|–)\s+\S", line))
+    return bool(_BULLET.match(line)) and bool(_BULLET.sub("", line, count=1).strip())
+
+
+def _split_outside_parens(text: str, separator: str = ",") -> list[str]:
+    parts, depth, current = [], 0, ""
+    for char in text:
+        depth += char in "([{"
+        depth -= char in ")]}" and depth > 0
+        if char == separator and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+    parts.append(current)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _looks_like_location(text: str) -> bool:
+    text = text.strip()
+    if not text or len(text) > 45 or _ROLE_WORDS.search(text) or _COMPANY_WORDS.search(text):
+        return False
+    if re.fullmatch(r"(?:remote|hybrid|on-?site|wfh|online)(?:\s*,\s*[A-Za-z .'-]+)?", text, re.I):
+        return True
+    return bool(re.fullmatch(r"[A-Z][A-Za-z.'\- ]+(?:,\s*[A-Za-z][A-Za-z.'\- ]+){1,2}", text))
 
 
 def _role_company(line: str) -> tuple[str, str]:
-    """Title and company from one header, the way a portal role line is written."""
-    if line.endswith((".", "!", "?")) or len(line) > 90:
+    """Title and company from one header written as Title at/|/— Company or Title, Company."""
+    if line.endswith((".", "!", "?")) or len(line) > 110:
         return "", ""
-    match = re.match(r"^(?P<title>.+?)\s*(?:—|–|\||\bat\b)\s*(?P<company>.+)$", line, re.I)
-    if match and not _DATE_RANGE.search(match.group("title")):
-        return match.group("title").strip(" ,"), match.group("company").split(",")[0].strip(" ,")
-    if "," in line and not _DATE_RANGE.search(line):
-        title, company = [part.strip() for part in line.split(",", 1)]
-        if title and company and len(title) <= 80 and len(company) <= 80:
-            return title, company.split(",")[0].strip(" ,")
+    match = re.match(r"^(?P<a>.+?)\s+(?:—|–|-|\||@|at)\s+(?P<b>.+)$", line, re.I)
+    if match and not _DATE_RANGE.search(line):
+        return _title_and_company(match.group("a").strip(" ,"), match.group("b").strip(" ,"))
+    parts = _split_outside_parens(line)
+    if len(parts) >= 2 and not _DATE_RANGE.search(line):
+        first, second = parts[0], parts[1]
+        if len(first) <= 80 and len(second) <= 80 and not _looks_like_location(", ".join(parts[1:])):
+            return _title_and_company(first, second)
     return "", ""
 
 
-def _parse_jobs(experience_text: str) -> list[dict]:
-    """Split a resume experience section into separate roles."""
-    lines = [re.sub(r"\s+", " ", line).strip() for line in (experience_text or "").splitlines() if line.strip()]
+def _role_score(text: str) -> float:
+    """Above zero reads like a job title, below zero like an organisation."""
+    base = re.sub(r"\([^)]*\)", " ", text)
+    return len(_ROLE_WORDS.findall(base)) - 0.5 * len(_COMPANY_WORDS.findall(base))
+
+
+def _is_org_name(text: str) -> bool:
+    """A heading written in capitals is an organisation, not a job title."""
+    letters = [char for char in text if char.isalpha()]
+    return len(letters) >= 3 and all(char.isupper() for char in letters)
+
+
+def _title_and_company(
+    first: str,
+    second: str,
+    first_dated: bool = False,
+    second_dated: bool = False,
+) -> tuple[str, str]:
+    """Order two header texts as (title, company)."""
+    if _role_score(second) > _role_score(first):
+        return second, first
+    if _role_score(first) > _role_score(second):
+        return first, second
+    first_org = _is_org_name(first) or (first_dated and not second_dated)
+    second_org = _is_org_name(second) or (second_dated and not first_dated)
+    if first_org and not second_org:
+        return second, first
+    if second_org and not first_org:
+        return first, second
+    return first, second
+
+
+def _take_dates(entry: dict, text: str) -> str:
+    """Store a date range found in text on the entry, and return the text without it."""
+    match = _DATE_RANGE.search(text)
+    if match:
+        if not entry["startDate"]:
+            entry["startDate"] = match.group("start").strip()
+            entry["endDate"] = match.group("end").strip()
+        return (text[:match.start()] + text[match.end():]).strip(" ,|-–—()")
+    if _DATE_SINGLE.match(text.strip()):
+        if not entry["startDate"] and not entry["endDate"]:
+            entry["endDate"] = text.strip()
+        return ""
+    return text
+
+
+_COMPANY_LABEL = re.compile(
+    r"^(?:c\w{0,3}pany(?:\s+name)?|organi[sz]ation|employer|firm|client)\s*[:\-–—]\s*(?P<value>.+)$",
+    re.I,
+)
+_ROLE_LABEL = re.compile(
+    r"^(?:role|designation|position|job\s+title|title|profile)\s*[:\-–—]\s*(?P<value>.+)$",
+    re.I,
+)
+_LOCATION_LABEL = re.compile(r"^(?:location|place|city)\s*[:\-–—]\s*(?P<value>.+)$", re.I)
+_DURATION_LABEL = re.compile(r"^(?:duration|period|dates?)\s*[:\-–—]\s*(?P<value>.+)$", re.I)
+
+
+def _labelled(line: str) -> bool:
+    return any(pattern.match(line) for pattern in (_COMPANY_LABEL, _ROLE_LABEL, _LOCATION_LABEL, _DURATION_LABEL))
+
+
+def _resolve_entry(headers: list[str], notes: list[str]) -> dict:
+    """Turn the header rows of one role into title, company, dates, and location."""
+    entry = {"title": "", "company": "", "startDate": "", "endDate": "", "location": "", "description": ""}
+    texts: list[tuple[str, bool]] = []
+    for row in headers:
+        columns = _columns(row)
+        dated_row = bool(_DATE_RANGE.search(row))
+        for index, column in enumerate(columns):
+            column = column.strip().rstrip(".")
+            for pattern, field in (
+                (_COMPANY_LABEL, "company"),
+                (_ROLE_LABEL, "title"),
+                (_LOCATION_LABEL, "location"),
+            ):
+                match = pattern.match(column)
+                if match:
+                    entry[field] = entry[field] or match.group("value").strip(" .")
+                    column = ""
+                    break
+            duration = _DURATION_LABEL.match(column) if column else None
+            if duration:
+                column = duration.group("value")
+            column = _take_dates(entry, column) if column else ""
+            if not column:
+                continue
+            if index > 0 and not entry["location"] and _looks_like_location(column):
+                entry["location"] = column
+                continue
+            texts.append((column, dated_row))
+
+    leftover: list[str] = []
+    if not entry["title"] and not entry["company"] and texts:
+        title, company = _role_company(texts[0][0])
+        if title or company:
+            entry["title"], entry["company"] = title, company
+            texts = texts[1:]
+        elif len(texts) >= 2:
+            entry["title"], entry["company"] = _title_and_company(
+                texts[0][0], texts[1][0], texts[0][1], texts[1][1],
+            )
+            texts = texts[2:]
+        elif _role_score(texts[0][0]) > 0:
+            entry["title"] = texts[0][0]
+            texts = []
+        else:
+            entry["company"] = texts[0][0]
+            texts = []
+    for text, _dated in texts:
+        if not entry["title"] and _role_score(text) > 0:
+            entry["title"] = text
+        elif not entry["company"] and len(text) <= 80 and _role_score(text) <= 0 and not _looks_like_location(text):
+            entry["company"] = text
+        elif not entry["location"] and (_looks_like_location(text) or (len(text.split()) <= 3 and len(text) <= 30)):
+            entry["location"] = text
+        else:
+            leftover.append(text)
+    entry["description"] = "\n".join([*leftover, *notes]).strip()[:4000]
+    return entry
+
+
+def _parse_jobs(experience) -> list[dict]:
+    """Split an experience section into roles using layout, not fixed wording.
+
+    A role starts at a header row: a row with a date range, a row right before one,
+    or a labelled Company/Role row after the previous role's description. Up to a few
+    short rows after a header belong to the header (title, company, date, location).
+    Bullets and wrapped bullet lines are the description.
+    """
+    rows = experience if isinstance(experience, list) else _resume_rows(experience)
     jobs: list[dict] = []
-    current = None
+    headers: list[str] = []
     notes: list[str] = []
+    bullet_indent = -1
 
     def flush() -> None:
-        nonlocal current, notes
-        if current is None:
-            return
-        current["description"] = "\n".join(note for note in notes if note).strip()[:4000]
-        if _job_has_content(current):
-            jobs.append(_clean_job(current))
-        current = None
-        notes = []
+        nonlocal headers, notes
+        if headers or notes:
+            job = _clean_job(_resolve_entry(headers, notes))
+            if job["title"] and not job["company"] and jobs:
+                # A second role listed under the same employer heading.
+                job["company"] = jobs[-1]["company"]
+            if _job_has_content(job):
+                jobs.append(job)
+        headers, notes = [], []
 
-    def begin(title: str = "", company: str = "") -> None:
-        nonlocal current, notes
-        flush()
-        current = {
-            "title": title,
-            "company": company,
-            "startDate": "",
-            "endDate": "",
-            "location": "",
-            "description": "",
-        }
-        notes = []
+    def has_date(row: str) -> bool:
+        return bool(_DATE_RANGE.search(row))
 
-    for index, line in enumerate(lines):
+    for index, row in enumerate(rows):
+        line = " ".join(row.split())
+        indent = len(row) - len(row.lstrip())
+        upcoming = " ".join(rows[index + 1].split()) if index + 1 < len(rows) else ""
         if _is_bullet(line):
-            if current is None:
-                begin()
-            notes.append(re.sub(r"^(?:[•*]|\-|–)\s+", "", line).strip())
+            notes.append(_BULLET.sub("", line, count=1).strip())
+            bullet_indent = indent
             continue
-        date = _DATE_RANGE.search(line)
-        title, company = _role_company(line)
-        upcoming = lines[index + 1] if index + 1 < len(lines) else ""
-        followed_by_date = bool(upcoming) and not _is_bullet(upcoming) and bool(_DATE_RANGE.search(upcoming))
-        if date and not title and len(line) <= 60:
-            if current is None:
-                begin()
-            current["startDate"] = date.group("start")
-            end = date.group("end")
-            current["endDate"] = "Present" if end.casefold() in {"present", "current", "now"} else end
-            continue
-        if title or followed_by_date:
-            begin(title or line, company)
-            if date:
-                current["startDate"] = date.group("start")
-                end = date.group("end")
-                current["endDate"] = "Present" if end.casefold() in {"present", "current", "now"} else end
-            continue
-        if current is None:
-            begin(line)
-            continue
-        if not current["company"] and not current["startDate"]:
-            current["company"] = line[:150]
-            continue
-        if (
-            not current["location"]
-            and not notes
-            and len(line) <= 40
-            and len(line.split()) <= 4
-            and not line.endswith(".")
+        dated = has_date(line)
+        next_dated = bool(upcoming) and not _is_bullet(upcoming) and has_date(upcoming)
+        if bullet_indent >= 0 and notes and not dated and not _labelled(line) and (
+            line[:1].islower()
+            or indent > bullet_indent
+            or (not next_dated and not notes[-1].endswith((".", "!", "?", ":")))
         ):
-            current["location"] = line
+            notes[-1] = f"{notes[-1]} {line}"
+            continue
+        bullet_indent = -1
+        header_dated = any(has_date(header) for header in headers)
+        starts_role = dated or next_dated or _labelled(line) or bool(_role_company(line)[0])
+        if not headers and not notes:
+            headers.append(row)
+            continue
+        if starts_role and (notes or (dated and header_dated)) and not (
+            _labelled(line) and not notes
+        ):
+            flush()
+            headers.append(row)
+            continue
+        if not notes and (
+            _labelled(line)
+            or (len(headers) < 2 and len(line) <= 110 and not line.endswith("."))
+            or (len(headers) < 4 and (dated or _DATE_SINGLE.match(line) or _looks_like_location(line)
+                                      or (len(line) <= 30 and len(line.split()) <= 3)))
+        ):
+            headers.append(row)
             continue
         notes.append(line)
     flush()
@@ -1741,26 +1963,128 @@ def _extract_notice_period(text: str) -> str:
 
     return ""
 
-def _extract_skills(skills_text: str, full_text: str) -> list[str]:
+def _skill_items(rows: list[str]) -> list[str]:
+    """Items written in a skills section, including bullet grids that wrap into columns."""
+    items: list[str] = []
+    previous: list[tuple[int, int]] = []
+    for row in rows:
+        text = row.rstrip()
+        label = re.match(r"^\s*[A-Za-z][A-Za-z /&()+\-]{1,40}:\s*", text)
+        if label:
+            text = " " * label.end() + text[label.end():]
+        current: list[tuple[int, int]] = []
+        bulleted_row = any(char in text for char in _BULLET_CHARS)
+        for chunk in re.finditer(r"\S(?:.*?\S)?(?=\s{3,}|$)", text):
+            pieces = re.split(rf"[{re.escape(_BULLET_CHARS)}]", chunk.group(0))
+            offset = chunk.start()
+            for position, piece in enumerate(pieces):
+                piece = piece.strip()
+                column = offset + chunk.group(0).find(piece) if piece else offset
+                if not piece:
+                    continue
+                continued = bulleted_row and position == 0 and not chunk.group(0).lstrip()[:1] in _BULLET_CHARS
+                if continued:
+                    near = [index for col, index in previous if abs(col - column) <= 6]
+                    if near:
+                        items[near[0]] = f"{items[near[0]]} {piece}"
+                        continue
+                for part in _split_outside_parens(piece.replace(";", ",").replace(" | ", ",")):
+                    part = part.strip(" .-–—")
+                    if part and len(part) <= 40 and len(part.split()) <= 5:
+                        current.append((column, len(items)))
+                        items.append(part)
+        previous = current or previous
+    return items
 
-    source_text = skills_text or full_text
+
+def _job_recency(job: dict) -> tuple[int, int]:
+    """Newest role first. A current role sorts above every finished one."""
+    end = str(job.get("endDate") or "")
+    if end.casefold() in {"present", "current", "now", "ongoing", "today"}:
+        return (9999, 12)
+    years = re.findall(r"(?:19|20)\d{2}", end)
+    year = int(years[-1]) if years else 0
+    month = 0
+    named = re.search(_MONTH, end, re.I)
+    if named:
+        month = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }.get(named.group(0)[:3].casefold(), 0)
+    else:
+        numeric = re.match(r"\s*(0?[1-9]|1[0-2])\b", end)
+        if numeric:
+            month = int(numeric.group(1))
+    return (year, month)
+
+
+def _expand_glued_skill(item: str) -> list[str]:
+    """Split one skills-list item when missing commas joined two known skills."""
+    folded = item.casefold()
+    spans: list[tuple[int, int, str]] = []
+    for skill in sorted(_SKILL_TERMS, key=len, reverse=True):
+        pattern = rf"(?<![a-z0-9+#]){re.escape(skill.casefold())}(?![a-z0-9+#])"
+        for match in re.finditer(pattern, folded):
+            if any(match.start() < end and match.end() > start for start, end, _name in spans):
+                continue
+            spans.append((match.start(), match.end(), item[match.start():match.end()]))
+    if len(spans) < 2:
+        return [item]
+    spans.sort()
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, name in spans:
+        gap = item[cursor:start]
+        if "&" in gap or re.search(r"\band\b", gap, re.I):
+            return [item]
+        gap = gap.strip(" .,;/+-–—")
+        if gap and not all(len(token) <= 3 for token in gap.split()):
+            return [item]
+        if gap and pieces:
+            pieces[-1] = f"{pieces[-1]} {gap}"
+        pieces.append(name)
+        cursor = end
+    tail = item[cursor:].strip(" .,;/+-–—&")
+    if tail and not all(len(token) <= 3 for token in tail.split()):
+        return [item]
+    if tail and pieces:
+        pieces[-1] = f"{pieces[-1]} {tail}"
+    return pieces or [item]
+
+
+def _extract_skills(skills_text, full_text: str) -> list[str]:
+    rows = skills_text if isinstance(skills_text, list) else _resume_rows(skills_text)
+    discovered = _skill_items(rows)
+    written = " | ".join(discovered).casefold()
+    source_text = "\n".join(rows) if rows else full_text
     folded = source_text.casefold()
-
-    discovered = []
-
     for skill in _SKILL_TERMS:
-
-        pattern = (
-            rf"(?<![a-z0-9])"
-            rf"{re.escape(skill.casefold())}"
-            rf"(?![a-z0-9])"
-        )
-
-        if re.search(pattern, folded):
+        pattern = rf"(?<![a-z0-9+#]){re.escape(skill.casefold())}(?![a-z0-9+#])"
+        if re.search(pattern, folded) and not re.search(pattern, written):
             discovered.append(skill)
+    seen: set[str] = set()
+    result = []
+    for item in discovered:
+        for skill in _expand_glued_skill(item):
+            key = re.sub(r"[\s.]+", "", skill.casefold())
+            if key and key not in seen:
+                seen.add(key)
+                result.append(skill)
+    return result[:60]
 
-    return discovered
-def parse_resume(text: str) -> dict:
+
+def _pdf_links(content: bytes) -> list[str]:
+    """Link targets behind PDF text such as an icon labelled "linkedin" or "gmail"."""
+    try:
+        import pymupdf
+
+        with pymupdf.open(stream=content, filetype="pdf") as document:
+            return [link["uri"] for page in document for link in page.get_links() if link.get("uri")]
+    except Exception:
+        return []
+
+
+def parse_resume(text: str, links: list[str] | tuple = ()) -> dict:
 
     lines = _clean_resume_lines(text)
     joined = "\n".join(lines)
@@ -1781,21 +2105,26 @@ def parse_resume(text: str) -> dict:
         re.I,
     )
 
-    summary = _extract_section(lines, "summary")
-    skills_text = _extract_section(lines, "skills")
-    experience = _extract_section(lines, "experience")
-    education = _extract_section(lines, "education")
+    sections = _resume_sections(text)
+    summary = _section_text(sections.get("summary", []))
+    education = _section_text(sections.get("education", []))
 
-    jobs = _parse_jobs(experience)
+    jobs = _parse_jobs(sections.get("experience", []))
+    jobs.sort(key=_job_recency, reverse=True)
     current_title = jobs[0]["title"] if jobs else ""
     current_company = jobs[0]["company"] if jobs else ""
-    if not current_title and not current_company:
-        current_title, current_company = _extract_current_employment(experience)
 
     skills = _extract_skills(
-        skills_text,
+        sections.get("skills", []),
         joined,
     )
+    urls.extend(str(link) for link in links or () if str(link).casefold().startswith(("http://", "https://")))
+    urls.sort(key=lambda url: not url.casefold().startswith(("http://", "https://")))
+    if not email_match:
+        email_match = next(
+            (re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", str(link)) for link in links or () if "mailto:" in str(link)),
+            None,
+        )
 
     linkedin = next(
         (
@@ -1819,7 +2148,7 @@ def parse_resume(text: str) -> dict:
         (
             url.rstrip(".)]")
             for url in urls
-            if url not in {linkedin, github}
+            if "linkedin.com" not in url.casefold() and "github.com" not in url.casefold()
         ),
         "",
     )
@@ -1901,7 +2230,7 @@ def upload_resume(uid: str, payload: dict) -> dict:
             "could not extract enough text from this resume"
         )
 
-    extracted = parse_resume(text)
+    extracted = parse_resume(text, _pdf_links(content) if suffix == ".pdf" else ())
     filled = [name for name, value in extracted.items() if value]
     event(
         "profile",
@@ -1929,6 +2258,16 @@ def upload_resume(uid: str, payload: dict) -> dict:
             "uploadedAt": uploaded_at,
             "type": suffix.lstrip(".").upper(),
         }
+        try:
+            from Server.resume_analysis import analyze_if_enabled, remember_resume
+            remember_resume(uid, text, filename, suffix.lstrip(".").upper())
+        except Exception as exc:
+            event("resume", "error", f"resume text save failed: {exc}")
+        else:
+            try:
+                analyze_if_enabled(uid)
+            except Exception as exc:
+                event("resume", "error", f"auto analyse failed: {exc}")
 
         profile["updatedAt"] = uploaded_at
         profile.pop("completion", None)
@@ -2586,6 +2925,28 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         if route.path == "/api/health":
             self._send_json(200, {"status": "ok"})
             return
+        if route.path == "/api/resume/analysis":
+            uid = self._user_id("resume")
+            if not uid:
+                return
+            try:
+                from Server.resume_analysis import analysis_view
+                self._send_json(200, analysis_view(uid))
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+            return
+        if route.path == "/api/resume/download":
+            uid = self._user_id("resume")
+            if not uid:
+                return
+            try:
+                from Server.resume_analysis import download_resume
+                body, filename, mime = download_resume(uid)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_file(body, mime, filename)
+            return
         if route.path == "/api/jobs/stop":
             event("jobs", "info", "stop requested")
             uid = ""
@@ -2701,7 +3062,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             event("gemini", "info", f"generate started chars={len(prompt)}")
             try:
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.8-flash",
                     contents=prompt,
                 )
                 event("gemini", "info", "generate done")
@@ -2709,6 +3070,10 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 event("gemini", "error", f"generation failed: {exc}")
                 self._send_json(502, {"error": f"Gemini error: {exc}"})
+            return
+
+        if path in {"/api/resume/analyze", "/api/resume/compare", "/api/resume/rewrite"}:
+            self._resume_action(path)
             return
 
         if path == "/api/resume":
@@ -2832,6 +3197,52 @@ class JobsApiHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "body must be JSON"})
             return None
 
+    def _resume_action(self, path: str) -> None:
+        try:
+            client, uid = get_user_gemini_client(self.headers.get("Authorization"))
+        except ValueError as exc:
+            message = str(exc)
+            expired = "authorization" in message.casefold() or "token" in message.casefold() or "sign in" in message.casefold()
+            self._send_json(401 if expired else 400, {"error": message})
+            return
+        except Exception as exc:
+            self._send_json(500, {"error": f"Auth check failed: {exc}"})
+            return
+        from Server.resume_analysis import analyze_resume, compare_resumes, rewrite_resume
+        try:
+            if path == "/api/resume/analyze":
+                body = self._read_json()
+                if body is None:
+                    return
+                force = bool(body.get("force")) if isinstance(body, dict) else False
+                payload = analyze_resume(uid, client, force=force)
+            elif path == "/api/resume/compare":
+                body = self._read_json()
+                if body is None:
+                    return
+                filename = Path(str(body.get("filename") or "")).name if isinstance(body, dict) else ""
+                encoded = body.get("content") if isinstance(body, dict) else ""
+                try:
+                    content = base64.b64decode(encoded or "", validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise ValueError("resume content must be valid base64") from exc
+                if len(content) > MAX_RESUME_BYTES:
+                    raise ValueError("resume must be 8 MB or smaller")
+                payload = compare_resumes(uid, client, filename, content)
+            elif path == "/api/resume/rewrite":
+                payload = rewrite_resume(uid, client)
+            else:
+                payload = analyze_resume(uid, client)
+        except ValueError as exc:
+            event("resume", "error", f"{path} failed: {exc}")
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            event("resume", "error", f"{path} failed: {exc}")
+            self._send_json(502, {"error": f"Gemini error: {exc}"})
+            return
+        self._send_json(200, payload)
+
     def _user_id(self, area: str) -> str:
         try:
             return uid_from_authorization(self.headers.get("Authorization"))
@@ -2855,6 +3266,21 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 
+    def _send_file(self, body: bytes, mime: str, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self._send_cors()
+        self.end_headers()
+        self._write_body(body)
+
+    def _write_body(self, body: bytes) -> None:
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            event("api", "info", "client closed the connection before the response finished")
+
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -2862,7 +3288,7 @@ class JobsApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self._send_cors()
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
 
 def serve(host: str, port: int, country: str) -> None:
